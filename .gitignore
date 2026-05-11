@@ -1,0 +1,5 @@
+.idea
+.draft
+.venv
+.env
+__pycache__
