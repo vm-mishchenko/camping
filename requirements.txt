@@ -1,4 +1,6 @@
-langgraph==0.2.50
-langchain-anthropic==0.3.0
-python-dotenv==1.0.0
-pydantic>=2.0
+langgraph==1.1.10
+langchain==1.2.18
+langchain-anthropic==1.4.3
+langgraph-checkpoint-sqlite==3.0.3
+python-dotenv==1.2.2
+pydantic==2.13.4

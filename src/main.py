@@ -10,30 +10,40 @@ This handles both extremes with the same code:
   - Mixed                 -> some stages of 1, some of many
 
 Nodes:
-  make_plan    -> LLM produces the stages
+  make_plan          -> LLM produces the stages
   execute_plan_step  -> ReAct sub-agent does ONE step (many run in parallel via Send)
-  pop_stage    -> remove the just-finished stage from the plan
-  final_answer -> summarize the whole run for the user
+  pop_stage          -> remove the just-finished stage from the plan
+  final_answer       -> summarize the whole run for the user
+
+State persists in a SQLite checkpointer (data/checkpoints.db). Each run is
+identified by a thread_id. Kill the process at any point and restart with
+the same thread_id to resume from the last completed node.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 import urllib.request
+import uuid
 from operator import add
 from pathlib import Path
 from typing import Annotated, List, Tuple, TypedDict
 
 from dotenv import load_dotenv
+from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, StateGraph
-from langgraph.prebuilt import create_react_agent
 from langgraph.types import Send
 from pydantic import BaseModel, Field
 
 load_dotenv()
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+CHECKPOINT_DB = REPO_ROOT / "data" / "checkpoints.db"
 
 
 @tool
@@ -91,10 +101,10 @@ class Plan(BaseModel):
     )
 
 
-def build_app():
+def build_graph():
     llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", max_tokens=2048)
     planner = llm.with_structured_output(Plan)
-    executor = create_react_agent(llm, TOOLS)
+    executor = create_agent(llm, TOOLS)
 
     async def make_plan(state: RunState) -> dict:
         prompt = (
@@ -154,26 +164,63 @@ def build_app():
     graph.add_edge("execute_plan_step", "pop_stage")
     graph.add_conditional_edges("pop_stage", dispatch, ["execute_plan_step", "final_answer"])
     graph.add_edge("final_answer", END)
-    return graph.compile()
+    return graph
 
 
-async def run(goal: str) -> str:
-    app = build_app()
-    initial: RunState = {"goal": goal, "plan": [], "past_steps": [], "response": ""}
-    final = await app.ainvoke(initial, config={"recursion_limit": 50})
-    return final["response"]
+async def run_new(goal: str, thread_id: str) -> str:
+    CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
+        app = build_graph().compile(checkpointer=saver)
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+        initial: RunState = {"goal": goal, "plan": [], "past_steps": [], "response": ""}
+        final = await app.ainvoke(initial, config=config)
+        return final.get("response", "")
 
 
-if __name__ == "__main__":
+async def run_resume(thread_id: str) -> str:
+    async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
+        app = build_graph().compile(checkpointer=saver)
+        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+        snapshot = await app.aget_state(config)
+        if not snapshot or not snapshot.values:
+            raise SystemExit(f"No state found for thread_id={thread_id}")
+        final = await app.ainvoke(None, config=config)
+        return final.get("response", "")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Plan/execute agent with resumable runs.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--goal", help="Start a new run with this goal.")
+    group.add_argument("--resume", metavar="THREAD_ID", help="Resume an existing run.")
+    parser.add_argument("--thread-id", help="Override the auto-generated thread_id (new runs only).")
+    return parser.parse_args()
+
+
+async def main():
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("Set ANTHROPIC_API_KEY before running.")
 
-    goal = (
-        "Fetch the page titles of https://example.com, https://example.org, "
-        "and https://example.net, then write all three titles into one file "
-        "at /tmp/all_titles.txt, one per line."
-    )
+    args = parse_args()
 
-    answer = asyncio.run(run(goal))
+    if args.resume:
+        print(f"Resuming thread_id={args.resume}")
+        answer = await run_resume(args.resume)
+    else:
+        goal = args.goal or (
+            "Fetch the page titles of https://example.com, https://example.org, "
+            "and https://example.net, then write all three titles into one file "
+            "at /tmp/all_titles.txt, one per line."
+        )
+        thread_id = args.thread_id or str(uuid.uuid4())
+        print(f"Starting new run, thread_id={thread_id}")
+        print(f"To resume: python -m src.main --resume {thread_id}")
+        print(f"Goal: {goal}\n")
+        answer = await run_new(goal, thread_id)
+
     print("\n=== FINAL ANSWER ===")
     print(answer)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
