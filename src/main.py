@@ -29,6 +29,7 @@ import urllib.request
 import uuid
 from operator import add
 from pathlib import Path
+from random import random
 from typing import Annotated, List, Tuple, TypedDict
 
 from dotenv import load_dotenv
@@ -37,7 +38,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import Send
+from langgraph.types import Send, RetryPolicy
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -100,7 +101,6 @@ class Plan(BaseModel):
         )
     )
 
-
 def build_graph():
     llm = ChatAnthropic(model="claude-sonnet-4-5-20250929", max_tokens=2048)
     planner = llm.with_structured_output(Plan)
@@ -117,6 +117,9 @@ def build_graph():
         return {"plan": [s.steps for s in plan.stages]}
 
     async def execute_plan_step(state: StepState) -> dict:
+        if random() > 0.5:
+            raise Exception("test exception")
+        
         context = "\n".join(f"- {s}: {r[:200]}" for s, r in state["past_steps"]) or "(none)"
         prompt = (
             f"Overall goal: {state['goal']}\n"
@@ -156,7 +159,15 @@ def build_graph():
 
     graph = StateGraph(RunState)
     graph.add_node("make_plan", make_plan)
-    graph.add_node("execute_plan_step", execute_plan_step)
+    graph.add_node(
+        "execute_plan_step", 
+        execute_plan_step,
+        retry_policy=RetryPolicy(
+            max_attempts=3,
+            initial_interval=1.0,
+            backoff_factor=2.0,
+        ),
+    )
     graph.add_node("pop_stage", pop_stage)
     graph.add_node("final_answer", final_answer)
     graph.set_entry_point("make_plan")
