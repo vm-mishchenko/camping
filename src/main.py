@@ -68,17 +68,20 @@ def write_file(path: str, content: str) -> str:
 TOOLS = [fetch_url, write_file]
 
 
+# Shared state passed between graph nodes. `stage_index` advances through `plan.stages`.
 class RunState(TypedDict):
-    goal: str
-    plan: List[List[str]]
-    past_steps: Annotated[List[Tuple[str, str]], add]
-    response: str
+    goal: str # original agent goal
+    plan: Plan # plan contains stages; each stage is a list of steps that can be executed in parallel 
+    stage_index: int # the next stage in the plan to execute
+    completed_steps: Annotated[List[Tuple[str, str]], add]
+    response: str # final agent resposne
 
 
+# Per-step state for the worker subgraph; carries the overall goal plus prior results for context.
 class StepState(TypedDict):
-    goal: str
-    step: str
-    past_steps: List[Tuple[str, str]]
+    goal: str # original agent goal
+    step: str # specific step goal
+    past_steps: List[Tuple[str, str]] 
 
 
 class Stage(BaseModel):
@@ -114,45 +117,48 @@ def build_graph():
             f"Goal: {state['goal']}"
         )
         plan: Plan = await planner.ainvoke(prompt)
-        return {"plan": [s.steps for s in plan.stages]}
+        return {"plan": plan}
 
-    async def execute_plan_step(state: StepState) -> dict:
-        if random() > 0.5:
-            raise Exception("test exception")
+    async def execute_plan_step(step_state: StepState) -> dict:
+        # node policy.max_attempts defines how many times langgraph retries execute node
+        if random() > 0.9:
+            raise Exception("execute_plan_step exception")
         
-        context = "\n".join(f"- {s}: {r[:200]}" for s, r in state["past_steps"]) or "(none)"
+        context = "\n".join(f"- {s}: {r[:200]}" for s, r in step_state["past_steps"]) or "(none)"
         prompt = (
-            f"Overall goal: {state['goal']}\n"
+            f"Overall goal: {step_state['goal']}\n"
             f"Results from previous stages:\n{context}\n\n"
-            f"Do this single step using the available tools: {state['step']}\n"
+            f"Do this single step using the available tools: {step_state['step']}\n"
             "Report only what you did and what you observed."
         )
         result = await executor.ainvoke({"messages": [("user", prompt)]})
         output = result["messages"][-1].content
-        return {"past_steps": [(state["step"], output)]}
+        return {"completed_steps": [(step_state["step"], output)]}
 
     async def pop_stage(state: RunState) -> dict:
-        return {"plan": state["plan"][1:]}
+        return {"stage_index": state["stage_index"] + 1}
 
     async def final_answer(state: RunState) -> dict:
-        history = "\n".join(f"- {s}\n  -> {r}" for s, r in state["past_steps"])
+        history = "\n".join(f"- {s}\n  -> {r}" for s, r in state["completed_steps"])
         msg = await llm.ainvoke(
             f"Goal: {state['goal']}\n\nWhat was done:\n{history}\n\n"
             "Write a short final answer for the user."
         )
         return {"response": msg.content}
 
-    def dispatch(state: RunState):
-        if not state["plan"]:
+    def dispatch(state: RunState) -> list[Send]:
+        plan = state["plan"]
+        idx = state["stage_index"]
+        if idx >= len(plan.stages):
             return [Send("final_answer", state)]
 
-        current_stage = state["plan"][0]
+        current_stage = plan.stages[idx]
         sends = []
-        for step in current_stage:
+        for step in current_stage.steps:
             step_state: StepState = {
                 "goal": state["goal"],
                 "step": step,
-                "past_steps": state["past_steps"],
+                "past_steps": state["completed_steps"],
             }
             sends.append(Send("execute_plan_step", step_state))
         return sends
@@ -183,7 +189,13 @@ async def run_new(goal: str, thread_id: str) -> str:
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
         app = build_graph().compile(checkpointer=saver)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
-        initial: RunState = {"goal": goal, "plan": [], "past_steps": [], "response": ""}
+        initial: RunState = {
+            "goal": goal,
+            "plan": Plan(stages=[]),
+            "stage_index": 0,
+            "completed_steps": [],
+            "response": "",
+        }
         final = await app.ainvoke(initial, config=config)
         return final.get("response", "")
 

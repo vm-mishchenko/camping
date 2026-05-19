@@ -1,4 +1,4 @@
-# Camping
+# Spot
 
 Plan/execute agent loop built with LangGraph. The agent breaks a goal into steps, runs each step with a ReAct sub-agent, then writes a final answer.
 
@@ -63,7 +63,7 @@ Two tools are wired in:
 ## Project layout
 
 ```
-/camping
+/spot
  /src
   /main.py
  /requirements.txt
