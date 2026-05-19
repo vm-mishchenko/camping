@@ -10,10 +10,16 @@ This handles both extremes with the same code:
   - Mixed                 -> some stages of 1, some of many
 
 Nodes:
+  classify           -> LLM decides: NEWTASK (re-plan) or FOLLOWUP (answer directly)
   make_plan          -> LLM produces the stages
   execute_plan_step  -> ReAct sub-agent does ONE step (many run in parallel via Send)
   pop_stage          -> remove the just-finished stage from the plan
   final_answer       -> summarize the whole run for the user
+
+Each user message triggers a full graph run from START to END. The checkpointer
+(SQLite) persists the conversation history across turns via the add_messages
+reducer; scratch fields like plan and completed_steps are reset at the start of
+each run by the classify node.
 
 State persists in a SQLite checkpointer (data/checkpoints.db). Each run is
 identified by a thread_id. Kill the process at any point and restart with
@@ -28,9 +34,7 @@ import logging
 import os
 import urllib.request
 import uuid
-from operator import add
 from pathlib import Path
-from random import random
 from typing import Annotated, List, Literal, Tuple, TypedDict
 
 VERBOSE = 15
@@ -52,9 +56,9 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
-from langgraph.graph import StateGraph
+from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.types import Command, Send, RetryPolicy, interrupt
+from langgraph.types import Command, Send, RetryPolicy
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -84,21 +88,28 @@ def write_file(path: str, content: str) -> str:
 TOOLS = [fetch_url, write_file]
 
 
+def _steps_reducer(left: list, right: list) -> list:
+    """Like operator.add, but an empty right-hand side resets the list (for classify reset)."""
+    if not right:
+        return []
+    return (left or []) + right
+
+
 # Shared state passed between graph nodes. `stage_index` advances through `plan.stages`.
 class RunState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages] # full conversation history across turns
-    goal: str # current turn goal, extracted from the latest human message
-    plan: Plan # plan contains stages; each stage is a list of steps that can be executed in parallel
-    stage_index: int # the next stage in the plan to execute
-    completed_steps: Annotated[List[Tuple[str, str]], add]
-    response: str # final agent response
+    messages: Annotated[List[BaseMessage], add_messages]  # full conversation history across turns
+    goal: str  # current run goal, extracted from the latest human message
+    plan: Plan  # plan contains stages; each stage is a list of steps executed in parallel
+    stage_index: int  # the next stage in the plan to execute
+    completed_steps: Annotated[List[Tuple[str, str]], _steps_reducer]
+    response: str  # final agent response for the current turn
 
 
 # Per-step state for the worker subgraph; carries the overall goal plus prior results for context.
 class StepState(TypedDict):
-    goal: str # original agent goal
-    step: str # specific step goal
-    past_steps: List[Tuple[str, str]] 
+    goal: str  # original agent goal
+    step: str  # specific step goal
+    past_steps: List[Tuple[str, str]]
 
 
 class Stage(BaseModel):
@@ -121,10 +132,53 @@ class Plan(BaseModel):
         )
     )
 
+
 def build_graph():
     llm = ChatAnthropic(model="claude-haiku-4-5-20251001", max_tokens=2048)
     planner = llm.with_structured_output(Plan)
     executor = create_agent(llm, TOOLS)
+
+    async def classify(
+        state: RunState,
+    ) -> Command[Literal["make_plan", "final_answer"]]:
+        """Classify the latest user message as NEWTASK or FOLLOWUP and route accordingly.
+
+        Also resets per-run scratch (completed_steps, goal) so previous run data
+        does not leak into the current run.
+        """
+        user_msg = state["messages"][-1].content
+        log.verbose("classify: message=%r", user_msg)
+
+        # First-ever message is always a new task.
+        if len(state["messages"]) == 1:
+            log.verbose("classify: first message -> NEWTASK")
+            return Command(
+                update={"completed_steps": [], "goal": "", "plan": Plan(stages=[]), "stage_index": 0},
+                goto="make_plan",
+            )
+
+        decision = await llm.ainvoke(
+            list(state["messages"][:-1])
+            + [
+                HumanMessage(
+                    content=(
+                        "The user sent a new message. Reply with exactly one word:\n"
+                        "  FOLLOWUP  — if it is a question or comment about the previous result\n"
+                        "  NEWTASK   — if it is a new independent task to execute\n\n"
+                        f"Message: {user_msg}"
+                    )
+                )
+            ]
+        )
+        verdict = decision.content.strip().upper()
+        log.verbose("classify: verdict=%r", verdict)
+        goto: Literal["make_plan", "final_answer"] = (
+            "make_plan" if "NEWTASK" in verdict else "final_answer"
+        )
+        return Command(
+            update={"completed_steps": [], "goal": "", "plan": Plan(stages=[]), "stage_index": 0},
+            goto=goto,
+        )
 
     async def make_plan(state: RunState) -> dict:
         goal = state["messages"][-1].content
@@ -141,31 +195,6 @@ def build_graph():
             [[s for s in stage.steps] for stage in plan.stages],
         )
         return {"goal": goal, "plan": plan, "stage_index": 0, "completed_steps": []}
-
-    async def respond_or_replan(
-        state: RunState,
-    ) -> Command[Literal["make_plan", "final_answer"]]:
-        """Pause for the next user message, then classify and route."""
-        user_message: str = interrupt("Waiting for next user message")
-        new_msg = HumanMessage(content=user_message)
-        decision = await llm.ainvoke(
-            state["messages"]
-            + [
-                HumanMessage(
-                    content=(
-                        "The user sent a new message. Reply with exactly one word:\n"
-                        "  FOLLOWUP  — if it is a question or comment about the previous result\n"
-                        "  NEWTASK   — if it is a new independent task to execute\n\n"
-                        f"Message: {user_message}"
-                    )
-                )
-            ]
-        )
-        verdict = decision.content.strip().upper()
-        goto: Literal["make_plan", "final_answer"] = (
-            "make_plan" if "NEWTASK" in verdict else "final_answer"
-        )
-        return Command(update={"messages": [new_msg]}, goto=goto)
 
     async def execute_plan_step(step_state: StepState) -> dict:
         # node policy.max_attempts defines how many times langgraph retries the node
@@ -197,6 +226,7 @@ def build_graph():
         else:
             prompt = "Answer the user's latest message based on the conversation so far."
         msg = await llm.ainvoke(state["messages"] + [HumanMessage(content=prompt)])
+        log.verbose("final_answer: %r", msg.content[:120])
         return {"response": msg.content, "messages": [AIMessage(content=msg.content)]}
 
     def dispatch(state: RunState) -> list[Send]:
@@ -217,6 +247,7 @@ def build_graph():
         return sends
 
     graph = StateGraph(RunState)
+    graph.add_node("classify", classify)
     graph.add_node("make_plan", make_plan)
     graph.add_node(
         "execute_plan_step",
@@ -229,33 +260,27 @@ def build_graph():
     )
     graph.add_node("pop_stage", pop_stage)
     graph.add_node("final_answer", final_answer)
-    graph.add_node("respond_or_replan", respond_or_replan)
-    graph.set_entry_point("make_plan")
+    graph.set_entry_point("classify")
     graph.add_conditional_edges("make_plan", dispatch, ["execute_plan_step", "final_answer"])
     graph.add_edge("execute_plan_step", "pop_stage")
     graph.add_conditional_edges("pop_stage", dispatch, ["execute_plan_step", "final_answer"])
-    # After answering, hand off to respond_or_replan which calls interrupt() to wait
-    # for the next user message, then routes via Command(goto=...).
-    graph.add_edge("final_answer", "respond_or_replan")
+    graph.add_edge("final_answer", END)
     return graph
 
 
 async def run_chat(thread_id: str) -> None:
-    """Interactive REPL. Each user message is a new turn on the same thread_id."""
+    """Interactive REPL. Each user message triggers a full graph run from START to END."""
     CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
     async with AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB)) as saver:
-        # app https://reference.langchain.com/python/langgraph/graph/state/CompiledStateGraph
         app = build_graph().compile(checkpointer=saver)
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
 
         snapshot = await app.aget_state(config)
-        is_new = not snapshot or not snapshot.values
-        if not is_new:
+        if snapshot and snapshot.values:
             print(f"Resuming session (thread_id={thread_id}). Type your follow-up.\n")
 
         print("Type your message and press Enter. Ctrl-C or Ctrl-D to quit.\n")
 
-        first_turn = is_new
         while True:
             try:
                 user_input = input("You: ").strip()
@@ -265,22 +290,10 @@ async def run_chat(thread_id: str) -> None:
             if not user_input:
                 continue
 
-            if first_turn:
-                # New session: start the graph from make_plan.
-                first_turn = False
-                graph_input: dict = {
-                    "messages": [HumanMessage(content=user_input)],
-                    "plan": Plan(stages=[]),
-                    "stage_index": 0,
-                    "completed_steps": [],
-                    "response": "",
-                }
-            else:
-                # Graph is paused inside respond_or_replan's interrupt() call.
-                # Pass the user message as the resume value.
-                graph_input = Command(resume=user_input)
-
-            final = await app.ainvoke(graph_input, config=config)
+            final = await app.ainvoke(
+                {"messages": [HumanMessage(content=user_input)]},
+                config=config,
+            )
             answer = final.get("response", "")
             print(f"\nAgent: {answer}\n")
 
