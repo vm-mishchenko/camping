@@ -123,15 +123,23 @@ class UserMessage:
 
 
 @dataclass
-class AppMessage:
-    """An app turn in the thread history."""
-    classification: Classification
+class TaskAppMessage:
+    """An app turn that ran the graph (Classification.NEWTASK)."""
     response: str
     started_at: datetime
     elapsed_ms: int
     graph_executions: List[GraphExecution] = field(default_factory=list)
 
 
+@dataclass
+class FollowupAppMessage:
+    """An app turn answered directly from context (Classification.FOLLOWUP)."""
+    response: str
+    started_at: datetime
+    elapsed_ms: int
+
+
+AppMessage = TaskAppMessage | FollowupAppMessage
 HistoryEntry = UserMessage | AppMessage
 
 
@@ -382,7 +390,7 @@ async def run_chat(thread_id: str) -> None:
             log.verbose("app: classification=%r for %r", classification, user_input[:60])
 
             reporter = Reporter()
-            graph_executions: List[GraphExecution] = []
+            app_message: AppMessage
 
             if classification == Classification.NEWTASK:
                 reporter.print("Starting a new task...")
@@ -404,10 +412,16 @@ async def run_chat(thread_id: str) -> None:
                     },
                     reporter=reporter,
                 )
-                graph_executions.append(GraphExecution(
-                    graph_thread_id=graph_thread_id,
+                elapsed_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+                app_message = TaskAppMessage(
                     response=response,
-                ))
+                    started_at=started_at,
+                    elapsed_ms=elapsed_ms,
+                    graph_executions=[GraphExecution(
+                        graph_thread_id=graph_thread_id,
+                        response=response,
+                    )],
+                )
             else:  # Classification.FOLLOWUP
                 reporter.print("Following up on previous answer...")
                 reporter.print("Answering from context...")
@@ -417,17 +431,16 @@ async def run_chat(thread_id: str) -> None:
                     + [HumanMessage(content="Answer the user's latest message based on the conversation above.")]
                 )
                 response = msg.content
+                elapsed_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+                app_message = FollowupAppMessage(
+                    response=response,
+                    started_at=started_at,
+                    elapsed_ms=elapsed_ms,
+                )
 
-            elapsed_ms = int((datetime.now() - started_at).total_seconds() * 1000)
             reporter.print(f"({elapsed_ms}ms)")
             thread.history.append(UserMessage(content=user_input))
-            thread.history.append(AppMessage(
-                classification=classification,
-                response=response,
-                started_at=started_at,
-                elapsed_ms=elapsed_ms,
-                graph_executions=graph_executions,
-            ))
+            thread.history.append(app_message)
             print(f"\nAgent: {response}\n")
 
 
