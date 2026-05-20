@@ -65,11 +65,17 @@ CHECKPOINT_DB = REPO_ROOT / "data" / "checkpoints.db"
 
 @tool
 def fetch_url(url: str) -> str:
-    """Fetch the given URL and return the response body as text (truncated to 4000 chars)."""
+    """Fetch the given URL and return status, headers, metrics, and body as text (body truncated to 4000 chars)."""
+    import time
     req = urllib.request.Request(url, headers={"User-Agent": "plan-execute-demo/1.0"})
+    t0 = time.perf_counter()
     with urllib.request.urlopen(req, timeout=15) as resp:
+        status = resp.status
+        headers = dict(resp.headers)
         body = resp.read().decode("utf-8", errors="replace")
-    return body[:4000]
+    latency_ms = round((time.perf_counter() - t0) * 1000)
+    metrics = f"latency_ms={latency_ms} body_bytes={len(body.encode())}"
+    return f"Status: {status}\nMetrics: {metrics}\nHeaders: {headers}\n\nBody:\n{body[:4000]}"
 
 
 @tool
@@ -273,6 +279,46 @@ def build_graph(llm: ChatAnthropic) -> StateGraph:
 # App layer
 # ---------------------------------------------------------------------------
 
+class Reporter:
+    """Progress sink for one user turn. Knows nothing about the domain.
+
+    Can be swapped for a WebSocket emitter, a logging sink, or a no-op
+    without changing any call sites.
+    """
+
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
+
+    def print(self, message: str) -> None:
+        print(f"{self._DIM}  {message}{self._RESET}")
+
+
+async def _run_graph(graph_app, inputs: dict, config: dict, reporter: Reporter) -> str:
+    """Stream a graph run and forward progress messages to reporter. Returns the final response."""
+    response = ""
+    async for chunk in graph_app.astream(inputs, config=config, stream_mode="updates"):
+        for node, update in chunk.items():
+            if node == "make_plan":
+                plan = update.get("plan")
+                if plan and plan.stages:
+                    total = sum(len(s.steps) for s in plan.stages)
+                    reporter.print(f"Plan: {len(plan.stages)} stage(s), {total} step(s)")
+                    for i, stage in enumerate(plan.stages):
+                        if len(stage.steps) == 1:
+                            reporter.print(f"  Stage {i + 1}: {stage.steps[0]}")
+                        else:
+                            reporter.print(f"  Stage {i + 1} (parallel):")
+                            for step in stage.steps:
+                                reporter.print(f"    - {step}")
+            elif node == "execute_plan_step":
+                for step, _ in update.get("completed_steps", []):
+                    reporter.print(f"  done: {step[:100]}")
+            elif node == "final_answer":
+                reporter.print("Composing answer...")
+                response = update.get("response", "")
+    return response
+
+
 async def _classify(user_input: str, thread: ThreadState, llm: ChatAnthropic) -> str:
     """Return 'NEWTASK' or 'FOLLOWUP' for the given user message."""
     if not thread.history:
@@ -323,13 +369,16 @@ async def run_chat(thread_id: str) -> None:
             classification = await _classify(user_input, thread, llm)
             log.verbose("app: classification=%r for %r", classification, user_input[:60])
 
+            reporter = Reporter()
             graph_executions: List[GraphExecution] = []
 
             if classification == "NEWTASK":
+                reporter.print("Starting a new task...")
                 graph_thread_id = str(uuid.uuid4())
                 context_messages = thread.to_messages()
-                result = await graph_app.ainvoke(
-                    {
+                response = await _run_graph(
+                    graph_app,
+                    inputs={
                         "goal": user_input,
                         "messages": context_messages + [HumanMessage(content=user_input)],
                         "plan": Plan(stages=[]),
@@ -341,14 +390,15 @@ async def run_chat(thread_id: str) -> None:
                         "configurable": {"thread_id": graph_thread_id},
                         "recursion_limit": 50,
                     },
+                    reporter=reporter,
                 )
-                response = result["response"]
                 graph_executions.append(GraphExecution(
                     graph_thread_id=graph_thread_id,
                     response=response,
                 ))
             else:
-                # FOLLOWUP: answer directly from conversation context, no graph needed.
+                reporter.print("Following up on previous answer...")
+                reporter.print("Answering from context...")
                 context_messages = thread.to_messages() + [HumanMessage(content=user_input)]
                 msg = await llm.ainvoke(
                     context_messages
@@ -357,6 +407,7 @@ async def run_chat(thread_id: str) -> None:
                 response = msg.content
 
             elapsed_ms = int((datetime.now() - started_at).total_seconds() * 1000)
+            reporter.print(f"({elapsed_ms}ms)")
             thread.history.append(UserMessage(content=user_input))
             thread.history.append(AppMessage(
                 classification=classification,
