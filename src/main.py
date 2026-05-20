@@ -27,6 +27,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Annotated, Dict, List, Tuple, TypedDict
 
@@ -94,6 +95,20 @@ TOOLS = [fetch_url, write_file]
 # App-layer data structures
 # ---------------------------------------------------------------------------
 
+class Classification(str, Enum):
+    NEWTASK = "NEWTASK"
+    FOLLOWUP = "FOLLOWUP"
+
+
+class ClassificationResult(BaseModel):
+    classification: Classification = Field(
+        description=(
+            f"{Classification.NEWTASK} — new independent task to execute; "
+            f"{Classification.FOLLOWUP} — question or comment about the previous result"
+        )
+    )
+
+
 @dataclass
 class GraphExecution:
     """Record of one graph invocation within a single app turn."""
@@ -110,7 +125,7 @@ class UserMessage:
 @dataclass
 class AppMessage:
     """An app turn in the thread history."""
-    classification: str                                    # "NEWTASK" | "FOLLOWUP"
+    classification: Classification
     response: str
     started_at: datetime
     elapsed_ms: int
@@ -319,10 +334,10 @@ async def _run_graph(graph_app, inputs: dict, config: dict, reporter: Reporter) 
     return response
 
 
-async def _classify(user_input: str, thread: ThreadState, llm: ChatAnthropic) -> str:
-    """Return 'NEWTASK' or 'FOLLOWUP' for the given user message."""
+async def _classify(user_input: str, thread: ThreadState, llm: ChatAnthropic) -> Classification:
+    """Classify the user message as NEWTASK or FOLLOWUP."""
     if not thread.history:
-        return "NEWTASK"
+        return Classification.NEWTASK
 
     # Build context from the last 3 pairs (6 entries) of history.
     recent_pairs: List[str] = []
@@ -331,17 +346,14 @@ async def _classify(user_input: str, thread: ThreadState, llm: ChatAnthropic) ->
         if isinstance(entries[i], UserMessage) and isinstance(entries[i + 1], AppMessage):
             recent_pairs.append(f"User: {entries[i].content}\nAssistant: {entries[i + 1].response}")
     recent = "\n".join(recent_pairs)
-    decision = await llm.ainvoke([
+    classifier = llm.with_structured_output(ClassificationResult)
+    result: ClassificationResult = await classifier.ainvoke([
         HumanMessage(content=(
             f"Conversation so far:\n{recent}\n\n"
-            f"New message: {user_input}\n\n"
-            "Reply with exactly one word:\n"
-            "  FOLLOWUP  — question or comment about the previous result\n"
-            "  NEWTASK   — new independent task to execute"
+            f"Classify this new message: {user_input}"
         ))
     ])
-    verdict = decision.content.strip().upper()
-    return "NEWTASK" if "NEWTASK" in verdict else "FOLLOWUP"
+    return result.classification
 
 
 async def run_chat(thread_id: str) -> None:
@@ -372,7 +384,7 @@ async def run_chat(thread_id: str) -> None:
             reporter = Reporter()
             graph_executions: List[GraphExecution] = []
 
-            if classification == "NEWTASK":
+            if classification == Classification.NEWTASK:
                 reporter.print("Starting a new task...")
                 graph_thread_id = str(uuid.uuid4())
                 context_messages = thread.to_messages()
@@ -396,7 +408,7 @@ async def run_chat(thread_id: str) -> None:
                     graph_thread_id=graph_thread_id,
                     response=response,
                 ))
-            else:
+            else:  # Classification.FOLLOWUP
                 reporter.print("Following up on previous answer...")
                 reporter.print("Answering from context...")
                 context_messages = thread.to_messages() + [HumanMessage(content=user_input)]
